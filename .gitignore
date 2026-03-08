@@ -35,6 +35,8 @@
 .cache/
 bin/
 build/
+/.idea/
+/cmake-build-debug/
 data/
 
 *.pyc
