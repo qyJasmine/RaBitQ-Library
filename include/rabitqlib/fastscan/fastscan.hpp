@@ -3,7 +3,11 @@
 
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #include <array>
 #include <cassert>
@@ -223,9 +227,46 @@ inline void accumulate(
         _mm256_blend_epi32(accu2, accu3, 0xF0)
     );
     _mm256_storeu_si256((__m256i*)&result[16], dis1);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    std::fill(result, result + kBatchSize, static_cast<uint16_t>(0));
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    alignas(16) uint8_t tmp_lo[16];
+    alignas(16) uint8_t tmp_hi[16];
+    for (size_t base = 0; base < code_length; base += 32) {
+        for (size_t lane = 0; lane < 2; ++lane) {
+            const size_t off = base + lane * 16;
+            const uint8x16_t c = vld1q_u8(&codes[off]);
+            const uint8x16_t lut = vld1q_u8(&lp_table[off]);
+            const uint8x16_t lo = vandq_u8(c, low_mask);
+            const uint8x16_t hi = vandq_u8(vshrq_n_u8(c, 4), low_mask);
+            const uint8x16_t rlo = vqtbl1q_u8(lut, lo);
+            const uint8x16_t rhi = vqtbl1q_u8(lut, hi);
+            vst1q_u8(tmp_lo, rlo);
+            vst1q_u8(tmp_hi, rhi);
+            for (size_t j = 0; j < 16; ++j) {
+                const size_t idx = static_cast<size_t>(kPerm0[j]);
+                result[idx] = static_cast<uint16_t>(result[idx] + tmp_lo[j]);
+                result[idx + 16] = static_cast<uint16_t>(result[idx + 16] + tmp_hi[j]);
+            }
+        }
+    }
 #else
-    std::cerr << "no avx simd supported!\n";
-    exit(1);
+    // Scalar fallback for non-x86 architectures (e.g., aarch64).
+    std::fill(result, result + kBatchSize, static_cast<uint16_t>(0));
+    for (size_t base = 0; base < code_length; base += 32) {
+        // Each 32-byte block contains two 16-byte lanes, each lane has one LUT.
+        for (size_t b = 0; b < 32; ++b) {
+            const uint8_t c = codes[base + b];
+            const uint8_t lo = c & 0x0F;
+            const uint8_t hi = (c >> 4) & 0x0F;
+            const size_t lane_base = base + ((b / 16) * 16);
+            const uint8_t lut_lo = lp_table[lane_base + lo];
+            const uint8_t lut_hi = lp_table[lane_base + hi];
+            const size_t idx = static_cast<size_t>(kPerm0[b & 15]);
+            result[idx] = static_cast<uint16_t>(result[idx] + lut_lo);
+            result[idx + 16] = static_cast<uint16_t>(result[idx + 16] + lut_hi);
+        }
+    }
 #endif
 }
 

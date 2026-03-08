@@ -1,6 +1,8 @@
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 #include <omp.h>
 
 #include <cmath>
@@ -24,8 +26,15 @@ inline void packing_1bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_compact += 2;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t j = 0; j < dim; j += 16) {
+        uint16_t code = 0;
+        for (size_t i = 0; i < 16; ++i) {
+            code |= static_cast<uint16_t>(o_raw[i] & 0x1U) << i;
+        }
+        std::memcpy(o_compact, &code, sizeof(uint16_t));
+        o_raw += 16;
+        o_compact += 2;
+    }
 #endif
 }
 
@@ -52,8 +61,17 @@ inline void packing_2bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_compact += 16;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t j = 0; j < dim; j += 64) {
+        for (size_t i = 0; i < 16; ++i) {
+            uint8_t c = static_cast<uint8_t>(o_raw[i] & 0x3U);
+            c |= static_cast<uint8_t>((o_raw[i + 16] & 0x3U) << 2);
+            c |= static_cast<uint8_t>((o_raw[i + 32] & 0x3U) << 4);
+            c |= static_cast<uint8_t>((o_raw[i + 48] & 0x3U) << 6);
+            o_compact[i] = c;
+        }
+        o_raw += 64;
+        o_compact += 16;
+    }
 #endif
 }
 
@@ -100,8 +118,26 @@ inline void packing_3bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_compact += 8;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t d = 0; d < dim; d += 64) {
+        for (size_t i = 0; i < 16; ++i) {
+            uint8_t c = static_cast<uint8_t>(o_raw[i] & 0x3U);
+            c |= static_cast<uint8_t>((o_raw[i + 16] & 0x3U) << 2);
+            c |= static_cast<uint8_t>((o_raw[i + 32] & 0x3U) << 4);
+            c |= static_cast<uint8_t>((o_raw[i + 48] & 0x3U) << 6);
+            o_compact[i] = c;
+        }
+        o_compact += 16;
+
+        uint64_t top_bit = 0;
+        for (size_t idx = 0; idx < 64; ++idx) {
+            const uint64_t bit = static_cast<uint64_t>((o_raw[idx] >> 2) & 0x1U);
+            const size_t pos = ((idx & 7UL) << 3U) | (idx >> 3U);
+            top_bit |= (bit << pos);
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
+        o_raw += 64;
+        o_compact += 8;
+    }
 #endif
 }
 
@@ -125,8 +161,14 @@ inline void packing_4bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_compact += 8;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t j = 0; j < dim; j += 16) {
+        for (size_t i = 0; i < 8; ++i) {
+            o_compact[i] = static_cast<uint8_t>((o_raw[i] & 0x0FU) |
+                                                ((o_raw[i + 8] & 0x0FU) << 4));
+        }
+        o_raw += 16;
+        o_compact += 8;
+    }
 #endif
 }
 
@@ -170,8 +212,24 @@ inline void packing_5bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_compact += 8;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t j = 0; j < dim; j += 64) {
+        for (size_t i = 0; i < 16; ++i) {
+            o_compact[i] = static_cast<uint8_t>((o_raw[i] & 0x0FU) |
+                                                ((o_raw[i + 16] & 0x0FU) << 4));
+            o_compact[i + 16] = static_cast<uint8_t>((o_raw[i + 32] & 0x0FU) |
+                                                     ((o_raw[i + 48] & 0x0FU) << 4));
+        }
+        o_compact += 32;
+        uint64_t top_bit = 0;
+        for (size_t idx = 0; idx < 64; ++idx) {
+            const uint64_t bit = static_cast<uint64_t>((o_raw[idx] >> 4) & 0x1U);
+            const size_t pos = ((idx & 7UL) << 3U) | (idx >> 3U);
+            top_bit |= (bit << pos);
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
+        o_raw += 64;
+        o_compact += 8;
+    }
 #endif
 }
 
@@ -208,8 +266,19 @@ inline void packing_6bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_raw += 64;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t d = 0; d < dim; d += 64) {
+        for (size_t i = 0; i < 16; ++i) {
+            const uint8_t v0 = static_cast<uint8_t>(o_raw[i] & 0x3FU);
+            const uint8_t v1 = static_cast<uint8_t>(o_raw[i + 16] & 0x3FU);
+            const uint8_t v2 = static_cast<uint8_t>(o_raw[i + 32] & 0x3FU);
+            const uint8_t v3 = static_cast<uint8_t>(o_raw[i + 48] & 0x3FU);
+            o_compact[i] = static_cast<uint8_t>(v0 | ((v3 & 0x03U) << 6));
+            o_compact[i + 16] = static_cast<uint8_t>(v1 | (((v3 >> 2) & 0x03U) << 6));
+            o_compact[i + 32] = static_cast<uint8_t>(v2 | (((v3 >> 4) & 0x03U) << 6));
+        }
+        o_compact += 48;
+        o_raw += 64;
+    }
 #endif
 }
 
@@ -259,8 +328,27 @@ inline void packing_7bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_raw += 64;
     }
 #else
-    std::cerr << "Current only support AVX512F and AVX2 for packing excode\n" << std::flush;
-    exit(1);
+    for (size_t d = 0; d < dim; d += 64) {
+        for (size_t i = 0; i < 16; ++i) {
+            const uint8_t v0 = static_cast<uint8_t>(o_raw[i] & 0x3FU);
+            const uint8_t v1 = static_cast<uint8_t>(o_raw[i + 16] & 0x3FU);
+            const uint8_t v2 = static_cast<uint8_t>(o_raw[i + 32] & 0x3FU);
+            const uint8_t v3 = static_cast<uint8_t>(o_raw[i + 48] & 0x3FU);
+            o_compact[i] = static_cast<uint8_t>(v0 | ((v3 & 0x03U) << 6));
+            o_compact[i + 16] = static_cast<uint8_t>(v1 | (((v3 >> 2) & 0x03U) << 6));
+            o_compact[i + 32] = static_cast<uint8_t>(v2 | (((v3 >> 4) & 0x03U) << 6));
+        }
+        o_compact += 48;
+        uint64_t top_bit = 0;
+        for (size_t idx = 0; idx < 64; ++idx) {
+            const uint64_t bit = static_cast<uint64_t>((o_raw[idx] >> 6) & 0x1U);
+            const size_t pos = ((idx & 7UL) << 3U) | (idx >> 3U);
+            top_bit |= (bit << pos);
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
+        o_compact += 8;
+        o_raw += 64;
+    }
 #endif
 }
 

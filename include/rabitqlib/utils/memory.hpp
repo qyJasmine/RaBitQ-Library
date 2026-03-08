@@ -1,6 +1,8 @@
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 #include <sys/mman.h>
 
 #include <cstdlib>
@@ -22,10 +24,14 @@ class AlignedAllocator {
 
    public:
     using value_type = T;
+    using is_always_equal = std::true_type;
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_copy_assignment = std::true_type;
+    using propagate_on_container_swap = std::true_type;
 
     template <class U>
     struct rebind {
-        using other = AlignedAllocator<U, Alignment>;
+        using other = AlignedAllocator<U, Alignment, HugePage>;
     };
 
     constexpr AlignedAllocator() noexcept = default;
@@ -42,14 +48,32 @@ class AlignedAllocator {
 
         auto nbytes = round_up_to_multiple_of<size_t>(n * sizeof(T), Alignment);
         auto* ptr = std::aligned_alloc(Alignment, nbytes);
-        if (HugePage) {
+        if (HugePage && ptr != nullptr) {
+#ifdef MADV_HUGEPAGE
             madvise(ptr, nbytes, MADV_HUGEPAGE);
+#endif
         }
         return reinterpret_cast<T*>(ptr);
     }
 
     void deallocate(T* ptr, [[maybe_unused]] std::size_t n) { std::free(ptr); }
 };
+
+template <typename T1, typename T2, size_t Alignment, bool HugePage>
+inline bool operator==(
+    const AlignedAllocator<T1, Alignment, HugePage>&,
+    const AlignedAllocator<T2, Alignment, HugePage>&
+) noexcept {
+    return true;
+}
+
+template <typename T1, typename T2, size_t Alignment, bool HugePage>
+inline bool operator!=(
+    const AlignedAllocator<T1, Alignment, HugePage>&,
+    const AlignedAllocator<T2, Alignment, HugePage>&
+) noexcept {
+    return false;
+}
 
 template <typename T>
 struct Allocator {
@@ -78,8 +102,10 @@ template <size_t Alignment, typename T, bool HugePage = false>
 inline T* align_allocate(size_t nbytes) {
     auto size = round_up_to_multiple_of<size_t>(nbytes, Alignment);
     void* ptr = std::aligned_alloc(Alignment, size);
-    if (HugePage) {
+    if (HugePage && ptr != nullptr) {
+#ifdef MADV_HUGEPAGE
         madvise(ptr, size, MADV_HUGEPAGE);
+#endif
     }
     return static_cast<T*>(ptr);
 }

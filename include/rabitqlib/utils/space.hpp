@@ -1,7 +1,11 @@
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <emmintrin.h>
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <omp.h>
 
 #include <array>
@@ -271,6 +275,11 @@ inline PID exact_nn(
 
 namespace excode_ipimpl {
 
+inline uint8_t get_transposed_top_bit(uint64_t top_bits, size_t idx) {
+    const size_t bit_pos = ((idx & 7UL) << 3U) | (idx >> 3U);
+    return static_cast<uint8_t>((top_bits >> bit_pos) & 0x1ULL);
+}
+
 #if defined(__AVX2__)
 // helper function for AVX2 inner product
 inline void contribute_ip(__m128i vec, const float* __restrict__ query, __m256& sum) {
@@ -313,6 +322,38 @@ inline float mm256_reduce_add_ps(__m256 v) {
         result += i;
     }
     return result;
+}
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+inline void neon_fma_u8x16(
+    const float* __restrict__ query,
+    const uint8_t* __restrict__ coeff,
+    float32x4_t& s0,
+    float32x4_t& s1,
+    float32x4_t& s2,
+    float32x4_t& s3
+) {
+    const uint8x16_t c = vld1q_u8(coeff);
+    const uint16x8_t c_lo = vmovl_u8(vget_low_u8(c));
+    const uint16x8_t c_hi = vmovl_u8(vget_high_u8(c));
+
+    const float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(c_lo)));
+    const float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(c_lo)));
+    const float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(c_hi)));
+    const float32x4_t f3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(c_hi)));
+
+    s0 = vmlaq_f32(s0, vld1q_f32(query), f0);
+    s1 = vmlaq_f32(s1, vld1q_f32(query + 4), f1);
+    s2 = vmlaq_f32(s2, vld1q_f32(query + 8), f2);
+    s3 = vmlaq_f32(s3, vld1q_f32(query + 12), f3);
+}
+
+inline float neon_reduce4(float32x4_t s0, float32x4_t s1, float32x4_t s2, float32x4_t s3) {
+    const float32x4_t a = vaddq_f32(s0, s1);
+    const float32x4_t b = vaddq_f32(s2, s3);
+    const float32x4_t c = vaddq_f32(a, b);
+    return vaddvq_f32(c);
 }
 #endif
 
@@ -367,14 +408,22 @@ inline float ip64_fxu2_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
     float result = 0;
+#if defined(__AVX512F__) || defined(__AVX2__)
     const __m128i mask = _mm_set1_epi8(0b00000011);
+#endif
 
     for (size_t i = 0; i < dim; i += 64) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         __m128i compact = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
 
         __m128i vec_00_to_15 = _mm_and_si128(compact, mask);
@@ -400,11 +449,28 @@ inline float ip64_fxu2_avx(
         q = _mm512_loadu_ps(&query[i + 48]);
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip(vec_00_to_15, &query[i], sum);
         contribute_ip(vec_16_to_31, &query[i + 16], sum);
         contribute_ip(vec_32_to_47, &query[i + 32], sum);
         contribute_ip(vec_48_to_63, &query[i + 48], sum);
+#endif
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+        uint8_t v0[16];
+        uint8_t v1[16];
+        uint8_t v2[16];
+        uint8_t v3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            const uint8_t c = compact_code[j];
+            v0[j] = c & 0x03U;
+            v1[j] = (c >> 2) & 0x03U;
+            v2[j] = (c >> 4) & 0x03U;
+            v3[j] = (c >> 6) & 0x03U;
+        }
+        neon_fma_u8x16(&query[i], v0, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 16], v1, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 32], v2, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 48], v3, s0, s1, s2, s3);
 #endif
         compact_code += 16;
     }
@@ -413,6 +479,8 @@ inline float ip64_fxu2_avx(
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -424,15 +492,23 @@ inline float ip64_fxu3_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
     float result = 0;
+#if defined(__AVX512F__) || defined(__AVX2__)
     const __m128i mask = _mm_set1_epi8(0b11);
     const __m128i top_mask = _mm_set1_epi8(0b100);
+#endif
 
     for (size_t i = 0; i < dim; i += 64) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         __m128i compact2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         compact_code += 16;
 
@@ -476,11 +552,35 @@ inline float ip64_fxu3_avx(
         q = _mm512_loadu_ps(&query[i + 48]);
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip(vec_00_to_15, &query[i], sum);
         contribute_ip(vec_16_to_31, &query[i + 16], sum);
         contribute_ip(vec_32_to_47, &query[i + 32], sum);
         contribute_ip(vec_48_to_63, &query[i + 48], sum);
+#endif
+#else
+        const uint8_t* compact2 = compact_code;
+        compact_code += 16;
+        const uint64_t top_bits = *reinterpret_cast<const uint64_t*>(compact_code);
+        compact_code += 8;
+        uint8_t v0[16];
+        uint8_t v1[16];
+        uint8_t v2[16];
+        uint8_t v3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            v0[j] = (compact2[j] & 0x03U) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, j) << 2);
+            v1[j] = ((compact2[j] >> 2) & 0x03U) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 16 + j) << 2);
+            v2[j] = ((compact2[j] >> 4) & 0x03U) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 32 + j) << 2);
+            v3[j] = ((compact2[j] >> 6) & 0x03U) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 48 + j) << 2);
+        }
+        neon_fma_u8x16(&query[i], v0, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 16], v1, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 32], v2, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 48], v3, s0, s1, s2, s3);
 #endif
     }
 
@@ -488,6 +588,8 @@ inline float ip64_fxu3_avx(
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -499,13 +601,21 @@ inline float ip16_fxu4_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
     float result = 0.0F;
+#if defined(__AVX512F__) || defined(__AVX2__)
     constexpr int64_t kMask = 0x0f0f0f0f0f0f0f0f;
+#endif
     for (size_t i = 0; i < dim; i += 16) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         int64_t compact = *reinterpret_cast<const int64_t*>(compact_code);
         int64_t code0 = compact & kMask;
         int64_t code1 = (compact >> 4) & kMask;
@@ -515,8 +625,17 @@ inline float ip16_fxu4_avx(
         __m512 q = _mm512_loadu_ps(&query[i]);
         __m512 cf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(c8));
         sum = _mm512_fmadd_ps(cf, q, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip_signed(c8, &query[i], sum);
+#endif
+#else
+        uint8_t v[16];
+        for (size_t j = 0; j < 8; ++j) {
+            const uint8_t c = compact_code[j];
+            v[j] = c & 0x0FU;
+            v[8 + j] = (c >> 4) & 0x0FU;
+        }
+        neon_fma_u8x16(&query[i], v, s0, s1, s2, s3);
 #endif
         compact_code += 8;
     }
@@ -524,6 +643,8 @@ inline float ip16_fxu4_avx(
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -535,16 +656,24 @@ inline float ip64_fxu5_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
 
     float result = 0.0F;
+#if defined(__AVX512F__) || defined(__AVX2__)
     const __m128i mask = _mm_set1_epi8(0b1111);
     const __m128i top_mask = _mm_set1_epi8(0b10000);
+#endif
 
     for (size_t i = 0; i < dim; i += 64) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         __m128i compact4_1 =
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i compact4_2 =
@@ -592,17 +721,44 @@ inline float ip64_fxu5_avx(
         q = _mm512_loadu_ps(&query[i + 48]);
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip(vec_00_to_15, &query[i], sum);
         contribute_ip(vec_16_to_31, &query[i + 16], sum);
         contribute_ip(vec_32_to_47, &query[i + 32], sum);
         contribute_ip(vec_48_to_63, &query[i + 48], sum);
+#endif
+#else
+        const uint8_t* c1 = compact_code;
+        const uint8_t* c2 = compact_code + 16;
+        compact_code += 32;
+        const uint64_t top_bits = *reinterpret_cast<const uint64_t*>(compact_code);
+        compact_code += 8;
+        uint8_t v0[16];
+        uint8_t v1[16];
+        uint8_t v2[16];
+        uint8_t v3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            v0[j] = (c1[j] & 0x0FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, j) << 4);
+            v1[j] = ((c1[j] >> 4) & 0x0FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 16 + j) << 4);
+            v2[j] = (c2[j] & 0x0FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 32 + j) << 4);
+            v3[j] = ((c2[j] >> 4) & 0x0FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 48 + j) << 4);
+        }
+        neon_fma_u8x16(&query[i], v0, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 16], v1, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 32], v2, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 48], v3, s0, s1, s2, s3);
 #endif
     }
 #if defined(__AVX512F__)
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -614,15 +770,23 @@ inline float ip64_fxu6_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
     float result = 0.0F;
+#if defined(__AVX512F__) || defined(__AVX2__)
     const __m128i mask6 = _mm_set1_epi8(0b00111111);
     const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
+#endif
 
     for (size_t i = 0; i < dim; i += 64) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
         __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
@@ -659,17 +823,42 @@ inline float ip64_fxu6_avx(
         q = _mm512_loadu_ps(&query[i + 48]);
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip(vec_00_to_15, &query[i], sum);
         contribute_ip(vec_16_to_31, &query[i + 16], sum);
         contribute_ip(vec_32_to_47, &query[i + 32], sum);
         contribute_ip(vec_48_to_63, &query[i + 48], sum);
+#endif
+#else
+        const uint8_t* c1 = compact_code;
+        const uint8_t* c2 = compact_code + 16;
+        const uint8_t* c3 = compact_code + 32;
+        compact_code += 48;
+        uint8_t v0[16];
+        uint8_t v1[16];
+        uint8_t v2[16];
+        uint8_t v3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            v0[j] = c1[j] & 0x3FU;
+            v1[j] = c2[j] & 0x3FU;
+            v2[j] = c3[j] & 0x3FU;
+            v3[j] = static_cast<uint8_t>(
+                ((c1[j] >> 6) & 0x03U) | (((c2[j] >> 6) & 0x03U) << 2) |
+                (((c3[j] >> 6) & 0x03U) << 4)
+            );
+        }
+        neon_fma_u8x16(&query[i], v0, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 16], v1, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 32], v2, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 48], v3, s0, s1, s2, s3);
 #endif
     }
 #if defined(__AVX512F__)
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -681,17 +870,25 @@ inline float ip64_fxu7_avx(
     __m512 sum = _mm512_setzero_ps();
 #elif defined(__AVX2__)
     __m256 sum = _mm256_setzero_ps();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
 #else
-    std::cerr << "AVX2 or AVX512 is required for excode ip functions\n";
+    std::cerr << "AVX2/AVX512/NEON is required for excode ip functions\n";
     exit(1);
 #endif
 
     float result = 0.0F;
+#if defined(__AVX512F__) || defined(__AVX2__)
     const __m128i mask6 = _mm_set1_epi8(0b00111111);
     const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
     const __m128i top_mask = _mm_set1_epi8(0b1000000);
+#endif
 
     for (size_t i = 0; i < dim; i += 64) {
+#if defined(__AVX512F__) || defined(__AVX2__)
         __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
         __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
@@ -744,11 +941,40 @@ inline float ip64_fxu7_avx(
         q = _mm512_loadu_ps(&query[i + 48]);
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
-#elif defined(__AVX2__)
+#else
         contribute_ip(vec_00_to_15, &query[i], sum);
         contribute_ip(vec_16_to_31, &query[i + 16], sum);
         contribute_ip(vec_32_to_47, &query[i + 32], sum);
         contribute_ip(vec_48_to_63, &query[i + 48], sum);
+#endif
+#else
+        const uint8_t* c1 = compact_code;
+        const uint8_t* c2 = compact_code + 16;
+        const uint8_t* c3 = compact_code + 32;
+        compact_code += 48;
+        const uint64_t top_bits = *reinterpret_cast<const uint64_t*>(compact_code);
+        compact_code += 8;
+        uint8_t v0[16];
+        uint8_t v1[16];
+        uint8_t v2[16];
+        uint8_t v3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            v0[j] = (c1[j] & 0x3FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, j) << 6);
+            v1[j] = (c2[j] & 0x3FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 16 + j) << 6);
+            v2[j] = (c3[j] & 0x3FU) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 32 + j) << 6);
+            v3[j] = static_cast<uint8_t>(
+                        ((c1[j] >> 6) & 0x03U) | (((c2[j] >> 6) & 0x03U) << 2) |
+                        (((c3[j] >> 6) & 0x03U) << 4)
+                    ) |
+                    static_cast<uint8_t>(get_transposed_top_bit(top_bits, 48 + j) << 6);
+        }
+        neon_fma_u8x16(&query[i], v0, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 16], v1, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 32], v2, s0, s1, s2, s3);
+        neon_fma_u8x16(&query[i + 48], v3, s0, s1, s2, s3);
 #endif
     }
 
@@ -756,6 +982,8 @@ inline float ip64_fxu7_avx(
     result = _mm512_reduce_add_ps(sum);
 #elif defined(__AVX2__)
     result = mm256_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    result = neon_reduce4(s0, s1, s2, s3);
 #endif
     return result;
 }
@@ -899,8 +1127,20 @@ static inline void new_transpose_bin(
         q += 64;
     }
 #else
-    std::cerr << "AVX512 or AVX2 is required for new transpose bin\n";
-    exit(1);
+    for (size_t i = 0; i < padded_dim; i += 64) {
+        for (size_t j = 0; j < b_query; ++j) {
+            uint64_t bits = 0;
+            for (size_t k = 0; k < 64; ++k) {
+                uint16_t v = q[k];
+                size_t src_bit = b_query - 1 - j;
+                uint64_t bit = static_cast<uint64_t>((v >> src_bit) & 1U);
+                bits |= (bit << (63 - k));
+            }
+            tq[j] = bits;
+        }
+        tq += b_query;
+        q += 64;
+    }
 #endif
 }
 
@@ -909,6 +1149,7 @@ inline float mask_ip_x0_q_old(const float* query, const uint64_t* data, size_t p
     const auto* it_data = data;
     const auto* it_query = query;
 
+#if defined(__AVX512F__)
     __m512 sum = _mm512_setzero_ps();
     for (size_t i = 0; i < num_blk; ++i) {
         uint64_t bits = reverse_bits_u64(*it_data);
@@ -936,6 +1177,45 @@ inline float mask_ip_x0_q_old(const float* query, const uint64_t* data, size_t p
         it_query += 64;
     }
     return _mm512_reduce_add_ps(sum);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
+    for (size_t i = 0; i < num_blk; ++i) {
+        uint64_t bits = reverse_bits_u64(*it_data);
+        uint8_t m0[16];
+        uint8_t m1[16];
+        uint8_t m2[16];
+        uint8_t m3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            m0[j] = static_cast<uint8_t>((bits >> j) & 1ULL);
+            m1[j] = static_cast<uint8_t>((bits >> (16 + j)) & 1ULL);
+            m2[j] = static_cast<uint8_t>((bits >> (32 + j)) & 1ULL);
+            m3[j] = static_cast<uint8_t>((bits >> (48 + j)) & 1ULL);
+        }
+        excode_ipimpl::neon_fma_u8x16(it_query, m0, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 16, m1, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 32, m2, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 48, m3, s0, s1, s2, s3);
+        ++it_data;
+        it_query += 64;
+    }
+    return excode_ipimpl::neon_reduce4(s0, s1, s2, s3);
+#else
+    float result = 0.0F;
+    for (size_t i = 0; i < num_blk; ++i) {
+        uint64_t bits = reverse_bits_u64(*it_data);
+        for (size_t j = 0; j < 64; ++j) {
+            if ((bits >> j) & 1ULL) {
+                result += it_query[j];
+            }
+        }
+        ++it_data;
+        it_query += 64;
+    }
+    return result;
+#endif
 }
 
 inline float mask_ip_x0_q(const float* query, const uint64_t* data, size_t padded_dim) {
@@ -1008,9 +1288,44 @@ inline float mask_ip_x0_q(const float* query, const uint64_t* data, size_t padde
         result += reinterpret_cast<float*>(&sum)[i];
     }
     return result;
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0F);
+    float32x4_t s1 = vdupq_n_f32(0.0F);
+    float32x4_t s2 = vdupq_n_f32(0.0F);
+    float32x4_t s3 = vdupq_n_f32(0.0F);
+    for (size_t i = 0; i < num_blk; ++i) {
+        uint64_t bits = reverse_bits_u64(*it_data);
+        uint8_t m0[16];
+        uint8_t m1[16];
+        uint8_t m2[16];
+        uint8_t m3[16];
+        for (size_t j = 0; j < 16; ++j) {
+            m0[j] = static_cast<uint8_t>((bits >> j) & 1ULL);
+            m1[j] = static_cast<uint8_t>((bits >> (16 + j)) & 1ULL);
+            m2[j] = static_cast<uint8_t>((bits >> (32 + j)) & 1ULL);
+            m3[j] = static_cast<uint8_t>((bits >> (48 + j)) & 1ULL);
+        }
+        excode_ipimpl::neon_fma_u8x16(it_query, m0, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 16, m1, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 32, m2, s0, s1, s2, s3);
+        excode_ipimpl::neon_fma_u8x16(it_query + 48, m3, s0, s1, s2, s3);
+        ++it_data;
+        it_query += 64;
+    }
+    return excode_ipimpl::neon_reduce4(s0, s1, s2, s3);
 #else
-    std::cerr << "AVX512 or AVX2 is required for mask ip x0 q\n";
-    exit(1);
+    float result = 0.0F;
+    for (size_t i = 0; i < num_blk; ++i) {
+        uint64_t bits = reverse_bits_u64(*it_data);
+        for (size_t j = 0; j < 64; ++j) {
+            if ((bits >> j) & 1ULL) {
+                result += it_query[j];
+            }
+        }
+        ++it_data;
+        it_query += 64;
+    }
+    return result;
 #endif
     return 0.0F;
 }
@@ -1023,6 +1338,42 @@ inline float ip_x0_q(
     size_t padded_dim,
     size_t b_query
 ) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    auto popcount_u64x2 = [](uint64x2_t v) {
+        uint8x16_t bytes = vreinterpretq_u8_u64(v);
+        uint8x16_t cnt8 = vcntq_u8(bytes);
+        uint16x8_t cnt16 = vpaddlq_u8(cnt8);
+        uint32x4_t cnt32 = vpaddlq_u16(cnt16);
+        return vpaddlq_u32(cnt32);
+    };
+
+    const size_t num_blk = padded_dim / 64;
+    size_t ip = 0;
+    size_t ppc = 0;
+
+    const size_t vec_end = (num_blk / 2) * 2;
+    for (size_t i = 0; i < vec_end; i += 2) {
+        const uint64x2_t x_vec = vld1q_u64(data + i);
+        const uint64x2_t x_cnt = popcount_u64x2(x_vec);
+        ppc += static_cast<size_t>(vgetq_lane_u64(x_cnt, 0) + vgetq_lane_u64(x_cnt, 1));
+        for (size_t j = 0; j < b_query; ++j) {
+            uint64_t q_pair[2] = {query[(i + 0) * b_query + j], query[(i + 1) * b_query + j]};
+            const uint64x2_t q_vec = vld1q_u64(q_pair);
+            const uint64x2_t and_cnt = popcount_u64x2(vandq_u64(x_vec, q_vec));
+            ip += static_cast<size_t>(
+                      (vgetq_lane_u64(and_cnt, 0) + vgetq_lane_u64(and_cnt, 1)) << j
+                  );
+        }
+    }
+    for (size_t i = vec_end; i < num_blk; ++i) {
+        const uint64_t x = data[i];
+        ppc += __builtin_popcountll(x);
+        for (size_t j = 0; j < b_query; ++j) {
+            ip += (__builtin_popcountll(x & query[i * b_query + j]) << j);
+        }
+    }
+    return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
+#else
     auto num_blk = padded_dim / 64;
     const auto* it_data = data;
     const auto* it_query = query;
@@ -1043,9 +1394,33 @@ inline float ip_x0_q(
     }
 
     return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
+#endif
 }
 
 static inline uint32_t ip_bin_bin(const uint64_t* q, const uint64_t* d, size_t padded_dim) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    auto popcount_u64x2 = [](uint64x2_t v) {
+        uint8x16_t bytes = vreinterpretq_u8_u64(v);
+        uint8x16_t cnt8 = vcntq_u8(bytes);
+        uint16x8_t cnt16 = vpaddlq_u8(cnt8);
+        uint32x4_t cnt32 = vpaddlq_u16(cnt16);
+        return vpaddlq_u32(cnt32);
+    };
+
+    uint64_t ret = 0;
+    size_t iter = padded_dim / 64;
+    size_t vec_end = (iter / 2) * 2;
+    for (size_t i = 0; i < vec_end; i += 2) {
+        uint64x2_t qv = vld1q_u64(q + i);
+        uint64x2_t dv = vld1q_u64(d + i);
+        uint64x2_t c = popcount_u64x2(vandq_u64(qv, dv));
+        ret += vgetq_lane_u64(c, 0) + vgetq_lane_u64(c, 1);
+    }
+    for (size_t i = vec_end; i < iter; ++i) {
+        ret += __builtin_popcountll(d[i] & q[i]);
+    }
+    return static_cast<uint32_t>(ret);
+#else
     uint64_t ret = 0;
     size_t iter = padded_dim / 64;
     for (size_t i = 0; i < iter; ++i) {
@@ -1054,6 +1429,7 @@ static inline uint32_t ip_bin_bin(const uint64_t* q, const uint64_t* d, size_t p
         d++;
     }
     return ret;
+#endif
 }
 
 inline uint32_t ip_byte_bin(
@@ -1069,12 +1445,34 @@ inline uint32_t ip_byte_bin(
 }
 
 inline size_t popcount(const uint64_t* __restrict__ d, size_t length) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    auto popcount_u64x2 = [](uint64x2_t v) {
+        uint8x16_t bytes = vreinterpretq_u8_u64(v);
+        uint8x16_t cnt8 = vcntq_u8(bytes);
+        uint16x8_t cnt16 = vpaddlq_u8(cnt8);
+        uint32x4_t cnt32 = vpaddlq_u16(cnt16);
+        return vpaddlq_u32(cnt32);
+    };
+    size_t ret = 0;
+    size_t n64 = length / 64;
+    size_t vec_end = (n64 / 2) * 2;
+    for (size_t i = 0; i < vec_end; i += 2) {
+        uint64x2_t dv = vld1q_u64(d + i);
+        uint64x2_t c = popcount_u64x2(dv);
+        ret += static_cast<size_t>(vgetq_lane_u64(c, 0) + vgetq_lane_u64(c, 1));
+    }
+    for (size_t i = vec_end; i < n64; ++i) {
+        ret += __builtin_popcountll(d[i]);
+    }
+    return ret;
+#else
     size_t ret = 0;
     for (size_t i = 0; i < length / 64; ++i) {
         ret += __builtin_popcountll((*d));
         ++d;
     }
     return ret;
+#endif
 }
 
 template <typename T>

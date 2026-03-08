@@ -1,13 +1,17 @@
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
 
 // Helper: AVX2 64-bit Popcount; Mula's method
-inline __m256i popcount_avx2(__m256i v) {
 #if defined(__AVX2__)
+inline __m256i popcount_avx2(__m256i v) {
     // Lookup table for population count of 0-15
     const __m256i lookup = _mm256_setr_epi8(
         0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
@@ -28,11 +32,18 @@ inline __m256i popcount_avx2(__m256i v) {
 
     // Sum bytes horizontally into 64-bit integers (SAD against 0)
     return _mm256_sad_epu8(cnt_bytes, _mm256_setzero_si256());
-#else
-    std::cerr << "AVX2 is required for popcount_avx2\n";
-    exit(1);
-#endif
 }
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+inline uint64x2_t popcount_u64x2(uint64x2_t v) {
+    uint8x16_t bytes = vreinterpretq_u8_u64(v);
+    uint8x16_t cnt8 = vcntq_u8(bytes);
+    uint16x8_t cnt16 = vpaddlq_u8(cnt8);
+    uint32x4_t cnt32 = vpaddlq_u16(cnt16);
+    return vpaddlq_u32(cnt32);
+}
+#endif
 
 template <uint32_t b_query>
 inline float warmup_ip_x0_q(
@@ -195,11 +206,57 @@ inline float warmup_ip_x0_q(
     }
 
     return (delta * static_cast<float>(ip_scalar)) + (vl * static_cast<float>(ppc_scalar));
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    const size_t num_blk = padded_dim / 64;
+    size_t ip_scalar = 0;
+    size_t ppc_scalar = 0;
+
+    const size_t vec_width = 2;
+    const size_t vec_end = (num_blk / vec_width) * vec_width;
+
+    for (size_t i = 0; i < vec_end; i += vec_width) {
+        const uint64x2_t x_vec = vld1q_u64(data + i);
+        const uint64x2_t x_cnt = popcount_u64x2(x_vec);
+        ppc_scalar += static_cast<size_t>(vgetq_lane_u64(x_cnt, 0) + vgetq_lane_u64(x_cnt, 1));
+
+        for (uint32_t j = 0; j < b_query; ++j) {
+            uint64_t q_pair[2] = {query[(i + 0) * b_query + j], query[(i + 1) * b_query + j]};
+            const uint64x2_t q_vec = vld1q_u64(q_pair);
+            const uint64x2_t and_cnt = popcount_u64x2(vandq_u64(x_vec, q_vec));
+            const size_t pair_sum =
+                static_cast<size_t>(vgetq_lane_u64(and_cnt, 0) + vgetq_lane_u64(and_cnt, 1));
+            ip_scalar += (pair_sum << j);
+        }
+    }
+
+    for (size_t i = vec_end; i < num_blk; ++i) {
+        const uint64_t x = data[i];
+        ppc_scalar += __builtin_popcountll(x);
+        for (uint32_t j = 0; j < b_query; ++j) {
+            ip_scalar += (__builtin_popcountll(x & query[i * b_query + j]) << j);
+        }
+    }
+
+    return (delta * static_cast<float>(ip_scalar)) + (vl * static_cast<float>(ppc_scalar));
 #else
-    std::cerr << "AVX512 or AVX2 is required for warmup_ip_x0_q\n";
-    exit(1);
+    auto num_blk = padded_dim / 64;
+    const auto* it_data = data;
+    const auto* it_query = query;
+    size_t ip = 0;
+    size_t ppc = 0;
+
+    for (size_t i = 0; i < num_blk; ++i) {
+        uint64_t x = *static_cast<const uint64_t*>(it_data);
+        ppc += __builtin_popcountll(x);
+        for (size_t j = 0; j < b_query; ++j) {
+            uint64_t y = *static_cast<const uint64_t*>(it_query);
+            ip += (__builtin_popcountll(x & y) << j);
+            ++it_query;
+        }
+        ++it_data;
+    }
+    return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
 #endif
-    return 0.0f;
 }
 
 template <uint32_t b_query, uint32_t padded_dim>
@@ -211,24 +268,5 @@ inline float warmup_ip_x0_q(
     size_t _padded_dim = 0,  // not used
     size_t _b_query = 0      // not used
 ) {
-    auto num_blk = padded_dim / 64;
-    const auto* it_data = data;
-    const auto* it_query = query;
-
-    size_t ip = 0;
-    size_t ppc = 0;
-
-    for (size_t i = 0; i < num_blk; ++i) {
-        uint64_t x = *static_cast<const uint64_t*>(it_data);
-        ppc += __builtin_popcountll(x);
-
-        for (size_t j = 0; j < b_query; ++j) {
-            uint64_t y = *static_cast<const uint64_t*>(it_query);
-            ip += (__builtin_popcountll(x & y) << j);
-            it_query++;
-        }
-        it_data++;
-    }
-
-    return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
+    return warmup_ip_x0_q<b_query>(data, query, delta, vl, padded_dim, b_query);
 }

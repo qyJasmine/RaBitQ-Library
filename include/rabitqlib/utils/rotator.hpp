@@ -10,7 +10,10 @@
 #include <random>
 
 #include "rabitqlib/defines.hpp"
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#define RABITQ_X86_SIMD 1
 #include "rabitqlib/utils/fht_avx.hpp"
+#endif
 #include "rabitqlib/utils/space.hpp"
 #include "rabitqlib/utils/tools.hpp"
 
@@ -112,6 +115,7 @@ class MatrixRotator : public Rotator<T> {
     }
 };
 
+#if defined(RABITQ_X86_SIMD)
 static inline void flip_sign(const uint8_t* flip, float* data, size_t dim) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
     constexpr size_t kFloatsPerChunk = 64;  // Process 64 floats per iteration
@@ -368,6 +372,15 @@ class FhtKacRotator : public Rotator<float> {
         vec_rescale(rotated_vec, padded_dim_, 0.25F);
     }
 };
+#else
+class FhtKacRotator : public MatrixRotator<float> {
+   public:
+    explicit FhtKacRotator(size_t dim, size_t padded_dim)
+        : MatrixRotator<float>(dim, padded_dim) {}
+    FhtKacRotator() = default;
+    ~FhtKacRotator() override = default;
+};
+#endif
 }  // namespace rotator_impl
 
 // for given dim & type, set rotator, return padded dimension
@@ -395,8 +408,14 @@ Rotator<T>* choose_rotator(
             std::cerr << "FhtKacRotator is only for float type currently\n";
             exit(1);
         }
+#if !defined(RABITQ_X86_SIMD)
+        std::cerr << "FhtKacRotator is not available on this architecture, fallback to "
+                     "MatrixRotator\n";
+        return ::new rotator_impl::MatrixRotator<T>(dim, padded_dim);
+#else
         std::cerr << "FhtKacRotator is selected\n";
         return ::new rotator_impl::FhtKacRotator(dim, padded_dim);
+#endif
     }
 
     if (type == RotatorType::MatrixRotator) {

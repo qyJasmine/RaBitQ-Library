@@ -1,7 +1,12 @@
 #pragma once
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -19,14 +24,13 @@ inline void transfer_lut_hacc(const uint16_t* lut, size_t dim, uint8_t* hc_lut) 
     size_t num_codebook = dim >> 2;
 
     for (size_t i = 0; i < num_codebook; i++) {
-        // avx2 - 256, avx512 - 512
+        // avx2 - 256, avx512 - 512, scalar fallback uses 256-like layout.
 #if defined(__AVX512BW__)
         constexpr size_t kRegBits = 512;
 #elif defined(__AVX2__)
         constexpr size_t kRegBits = 256;
 #else
-        static_assert(false, "At least requried AVX2 for using fastscan\n");
-        exit(1);
+        constexpr size_t kRegBits = 256;
 #endif
         constexpr size_t kLaneBits = 128;
         constexpr size_t kByteBits = 8;
@@ -214,9 +218,66 @@ inline void accumulate_hacc(
     _mm256_storeu_si256((__m256i*)(accu_res + 8), res[1]);
     _mm256_storeu_si256((__m256i*)(accu_res + 16), res[2]);
     _mm256_storeu_si256((__m256i*)(accu_res + 24), res[3]);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    std::fill(accu_res, accu_res + fastscan::kBatchSize, 0);
+    const size_t code_length = dim << 2;
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    alignas(16) uint8_t lo_lo[16];
+    alignas(16) uint8_t lo_hi[16];
+    alignas(16) uint8_t hi_lo[16];
+    alignas(16) uint8_t hi_hi[16];
+    for (size_t base = 0; base < code_length; base += 32) {
+        const size_t table_idx = (base / 32) * 32;
+        const uint8x16_t lut_lo = vld1q_u8(hc_lut + table_idx);
+        const uint8x16_t lut_hi = vld1q_u8(hc_lut + table_idx + 16);
+        for (size_t lane = 0; lane < 2; ++lane) {
+            const uint8x16_t c = vld1q_u8(codes + base + lane * 16);
+            const uint8x16_t lo = vandq_u8(c, low_mask);
+            const uint8x16_t hi = vandq_u8(vshrq_n_u8(c, 4), low_mask);
+
+            const uint8x16_t r_lo_lo = vqtbl1q_u8(lut_lo, lo);
+            const uint8x16_t r_lo_hi = vqtbl1q_u8(lut_hi, lo);
+            const uint8x16_t r_hi_lo = vqtbl1q_u8(lut_lo, hi);
+            const uint8x16_t r_hi_hi = vqtbl1q_u8(lut_hi, hi);
+
+            vst1q_u8(lo_lo, r_lo_lo);
+            vst1q_u8(lo_hi, r_lo_hi);
+            vst1q_u8(hi_lo, r_hi_lo);
+            vst1q_u8(hi_hi, r_hi_hi);
+
+            for (size_t j = 0; j < 16; ++j) {
+                const int idx = fastscan::kPerm0[j];
+                const int32_t vlo =
+                    static_cast<int32_t>(lo_lo[j]) + (static_cast<int32_t>(lo_hi[j]) << 8);
+                const int32_t vhi =
+                    static_cast<int32_t>(hi_lo[j]) + (static_cast<int32_t>(hi_hi[j]) << 8);
+                accu_res[idx] += vlo;
+                accu_res[idx + 16] += vhi;
+            }
+        }
+    }
 #else
-    std::cerr << "AVX512 or AVX2 required for using fastscan\n";
-    exit(1);
+    // Scalar fallback for aarch64 and other non-x86 targets.
+    std::fill(accu_res, accu_res + fastscan::kBatchSize, 0);
+    const size_t code_length = dim << 2;
+    for (size_t base = 0; base < code_length; base += 32) {
+        const size_t table_idx = (base / 32) * 32;
+        const uint8_t* lut_lo = hc_lut + table_idx;
+        const uint8_t* lut_hi = hc_lut + table_idx + 16;
+        for (size_t b = 0; b < 32; ++b) {
+            const uint8_t c = codes[base + b];
+            const uint8_t lo = c & 0x0F;
+            const uint8_t hi = (c >> 4) & 0x0F;
+            const int idx = fastscan::kPerm0[b & 15];
+
+            const int32_t vlo =
+                static_cast<int32_t>(lut_lo[lo]) + (static_cast<int32_t>(lut_hi[lo]) << 8);
+            const int32_t vhi =
+                static_cast<int32_t>(lut_lo[hi]) + (static_cast<int32_t>(lut_hi[hi]) << 8);
+            accu_res[idx] += vlo;
+            accu_res[idx + 16] += vhi;
+        }
+    }
 #endif
 }
 }  // namespace rabitqlib::fastscan
