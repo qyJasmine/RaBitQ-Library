@@ -3,6 +3,9 @@
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include <omp.h>
 
 #include <cmath>
@@ -22,6 +25,30 @@ inline void packing_1bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         }
         std::memcpy(o_compact, &code, sizeof(uint16_t));
 
+        o_raw += 16;
+        o_compact += 2;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static const uint16_t kWeightsLo[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    static const uint16_t kWeightsHi[8] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    const uint16x8_t weight_lo = vld1q_u16(kWeightsLo);
+    const uint16x8_t weight_hi = vld1q_u16(kWeightsHi);
+    const uint8x16_t one_mask = vdupq_n_u8(0x1U);
+    for (size_t j = 0; j < dim; j += 16) {
+        const uint8x16_t raw = vandq_u8(vld1q_u8(o_raw), one_mask);
+        const uint16x8_t lo = vmovl_u8(vget_low_u8(raw));
+        const uint16x8_t hi = vmovl_u8(vget_high_u8(raw));
+        const uint16x8_t weighted_lo = vmulq_u16(lo, weight_lo);
+        const uint16x8_t weighted_hi = vmulq_u16(hi, weight_hi);
+        const uint32x4_t sum_lo32 = vpaddlq_u16(weighted_lo);
+        const uint32x4_t sum_hi32 = vpaddlq_u16(weighted_hi);
+        const uint64x2_t sum_lo64 = vpaddlq_u32(sum_lo32);
+        const uint64x2_t sum_hi64 = vpaddlq_u32(sum_hi32);
+        uint16_t code = static_cast<uint16_t>(
+            (vgetq_lane_u64(sum_lo64, 0) + vgetq_lane_u64(sum_lo64, 1)) +
+            (vgetq_lane_u64(sum_hi64, 0) + vgetq_lane_u64(sum_hi64, 1))
+        );
+        std::memcpy(o_compact, &code, sizeof(uint16_t));
         o_raw += 16;
         o_compact += 2;
     }
@@ -57,6 +84,21 @@ inline void packing_2bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
 
         _mm_storeu_si128(reinterpret_cast<__m128i*>(o_compact), compact);
         
+        o_raw += 64;
+        o_compact += 16;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x16_t two_mask = vdupq_n_u8(0x3U);
+    for (size_t j = 0; j < dim; j += 64) {
+        const uint8x16_t vec_00_to_15 = vandq_u8(vld1q_u8(o_raw), two_mask);
+        const uint8x16_t vec_16_to_31 = vandq_u8(vld1q_u8(o_raw + 16), two_mask);
+        const uint8x16_t vec_32_to_47 = vandq_u8(vld1q_u8(o_raw + 32), two_mask);
+        const uint8x16_t vec_48_to_63 = vandq_u8(vld1q_u8(o_raw + 48), two_mask);
+        const uint8x16_t compact = vorrq_u8(
+            vorrq_u8(vec_00_to_15, vshlq_n_u8(vec_16_to_31, 2)),
+            vorrq_u8(vshlq_n_u8(vec_32_to_47, 4), vshlq_n_u8(vec_48_to_63, 6))
+        );
+        vst1q_u8(o_compact, compact);
         o_raw += 64;
         o_compact += 16;
     }
