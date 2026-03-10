@@ -159,6 +159,43 @@ inline void packing_3bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
         o_raw += 64;
         o_compact += 8;
     }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // ! require dim % 64 == 0
+    const uint8x16_t mask2 = vdupq_n_u8(0x03U);
+    static const uint16_t kWeights[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint16x8_t weight = vld1q_u16(kWeights);
+    const uint8x8_t one_mask = vdup_n_u8(0x1U);
+    for (size_t d = 0; d < dim; d += 64) {
+        const uint8x16_t vec_00_to_15 = vandq_u8(vld1q_u8(o_raw), mask2);
+        const uint8x16_t vec_16_to_31 = vandq_u8(vld1q_u8(o_raw + 16), mask2);
+        const uint8x16_t vec_32_to_47 = vandq_u8(vld1q_u8(o_raw + 32), mask2);
+        const uint8x16_t vec_48_to_63 = vandq_u8(vld1q_u8(o_raw + 48), mask2);
+
+        const uint8x16_t compact2 = vorrq_u8(
+            vorrq_u8(vec_00_to_15, vshlq_n_u8(vec_16_to_31, 2)),
+            vorrq_u8(vshlq_n_u8(vec_32_to_47, 4), vshlq_n_u8(vec_48_to_63, 6))
+        );
+        vst1q_u8(o_compact, compact2);
+        o_compact += 16;
+
+        uint64_t top_bit = 0;
+        for (size_t i = 0; i < 64; i += 8) {
+            const uint8x8_t bytes = vld1_u8(o_raw + i);
+            const uint8x8_t bits = vand_u8(vshr_n_u8(bytes, 2), one_mask);
+            const uint16x8_t bits16 = vmovl_u8(bits);
+            const uint16x8_t weighted = vmulq_u16(bits16, weight);
+            const uint32x4_t sum32 = vpaddlq_u16(weighted);
+            const uint64x2_t sum64 = vpaddlq_u32(sum32);
+            const uint16_t mask = static_cast<uint16_t>(
+                vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1)
+            );
+            top_bit |= (static_cast<uint64_t>(mask) << (i / 8));
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
+
+        o_raw += 64;
+        o_compact += 8;
+    }
 #else
     for (size_t d = 0; d < dim; d += 64) {
         for (size_t i = 0; i < 16; ++i) {
@@ -199,6 +236,18 @@ inline void packing_4bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
 
         *reinterpret_cast<int64_t*>(o_compact) = compact;
 
+        o_raw += 16;
+        o_compact += 8;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // ! require dim % 16 == 0
+    const uint8x8_t mask = vdup_n_u8(0x0FU);
+    for (size_t j = 0; j < dim; j += 16) {
+        const uint8x16_t v = vld1q_u8(o_raw);
+        const uint8x8_t lo = vand_u8(vget_low_u8(v), mask);
+        const uint8x8_t hi = vand_u8(vget_high_u8(v), mask);
+        const uint8x8_t compact = vorr_u8(lo, vshl_n_u8(hi, 4));
+        vst1_u8(o_compact, compact);
         o_raw += 16;
         o_compact += 8;
     }
@@ -249,6 +298,49 @@ inline void packing_5bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
             top_bit |= ((cur_codes >> 4) & kMask1) << (i / 8);
         }
         std::memcpy(o_compact, &top_bit, sizeof(int64_t));
+
+        o_raw += 64;
+        o_compact += 8;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // ! require dim % 64 == 0
+    const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+    static const uint16_t kWeights[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint16x8_t weight = vld1q_u16(kWeights);
+    const uint8x8_t one_mask = vdup_n_u8(0x1U);
+    for (size_t j = 0; j < dim; j += 64) {
+        const uint8x16_t vec_00_to_15 = vld1q_u8(o_raw);
+        const uint8x16_t vec_16_to_31 = vld1q_u8(o_raw + 16);
+        const uint8x16_t vec_32_to_47 = vld1q_u8(o_raw + 32);
+        const uint8x16_t vec_48_to_63 = vld1q_u8(o_raw + 48);
+
+        const uint8x16_t compact4_1 = vorrq_u8(
+            vandq_u8(vec_00_to_15, mask4),
+            vshlq_n_u8(vandq_u8(vec_16_to_31, mask4), 4)
+        );
+        const uint8x16_t compact4_2 = vorrq_u8(
+            vandq_u8(vec_32_to_47, mask4),
+            vshlq_n_u8(vandq_u8(vec_48_to_63, mask4), 4)
+        );
+
+        vst1q_u8(o_compact, compact4_1);
+        vst1q_u8(o_compact + 16, compact4_2);
+        o_compact += 32;
+
+        uint64_t top_bit = 0;
+        for (size_t i = 0; i < 64; i += 8) {
+            const uint8x8_t bytes = vld1_u8(o_raw + i);
+            const uint8x8_t bits = vand_u8(vshr_n_u8(bytes, 4), one_mask);
+            const uint16x8_t bits16 = vmovl_u8(bits);
+            const uint16x8_t weighted = vmulq_u16(bits16, weight);
+            const uint32x4_t sum32 = vpaddlq_u16(weighted);
+            const uint64x2_t sum64 = vpaddlq_u32(sum32);
+            const uint16_t mask = static_cast<uint16_t>(
+                vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1)
+            );
+            top_bit |= (static_cast<uint64_t>(mask) << (i / 8));
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
 
         o_raw += 64;
         o_compact += 8;
@@ -304,6 +396,36 @@ inline void packing_6bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
             _mm_and_si128(_mm_slli_epi16(vec_48_to_63, 2), mask2)
         );
         _mm_storeu_si128(reinterpret_cast<__m128i*>(o_compact + 32), compact);
+        o_compact += 48;
+        o_raw += 64;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x16_t mask2 = vdupq_n_u8(0xC0U);
+    const uint8x16_t mask6 = vdupq_n_u8(0x3FU);
+    for (size_t d = 0; d < dim; d += 64) {
+        const uint8x16_t vec_00_to_15 = vld1q_u8(o_raw);
+        const uint8x16_t vec_16_to_31 = vld1q_u8(o_raw + 16);
+        const uint8x16_t vec_32_to_47 = vld1q_u8(o_raw + 32);
+        const uint8x16_t vec_48_to_63 = vld1q_u8(o_raw + 48);
+
+        uint8x16_t compact = vorrq_u8(
+            vandq_u8(vec_00_to_15, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 6), mask2)
+        );
+        vst1q_u8(o_compact, compact);
+
+        compact = vorrq_u8(
+            vandq_u8(vec_16_to_31, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 4), mask2)
+        );
+        vst1q_u8(o_compact + 16, compact);
+
+        compact = vorrq_u8(
+            vandq_u8(vec_32_to_47, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 2), mask2)
+        );
+        vst1q_u8(o_compact + 32, compact);
+
         o_compact += 48;
         o_raw += 64;
     }
@@ -365,6 +487,55 @@ inline void packing_7bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t
             top_bit |= ((cur_codes >> 6) & top_mask) << (i / 8);
         }
         std::memcpy(o_compact, &top_bit, sizeof(int64_t));
+
+        o_compact += 8;
+        o_raw += 64;
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x16_t mask2 = vdupq_n_u8(0xC0U);
+    const uint8x16_t mask6 = vdupq_n_u8(0x3FU);
+    static const uint16_t kWeights[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint16x8_t weight = vld1q_u16(kWeights);
+    const uint8x8_t one_mask = vdup_n_u8(0x1U);
+    for (size_t d = 0; d < dim; d += 64) {
+        const uint8x16_t vec_00_to_15 = vld1q_u8(o_raw);
+        const uint8x16_t vec_16_to_31 = vld1q_u8(o_raw + 16);
+        const uint8x16_t vec_32_to_47 = vld1q_u8(o_raw + 32);
+        const uint8x16_t vec_48_to_63 = vld1q_u8(o_raw + 48);
+
+        uint8x16_t compact = vorrq_u8(
+            vandq_u8(vec_00_to_15, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 6), mask2)
+        );
+        vst1q_u8(o_compact, compact);
+
+        compact = vorrq_u8(
+            vandq_u8(vec_16_to_31, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 4), mask2)
+        );
+        vst1q_u8(o_compact + 16, compact);
+
+        compact = vorrq_u8(
+            vandq_u8(vec_32_to_47, mask6),
+            vandq_u8(vshlq_n_u8(vec_48_to_63, 2), mask2)
+        );
+        vst1q_u8(o_compact + 32, compact);
+        o_compact += 48;
+
+        uint64_t top_bit = 0;
+        for (size_t i = 0; i < 64; i += 8) {
+            const uint8x8_t bytes = vld1_u8(o_raw + i);
+            const uint8x8_t bits = vand_u8(vshr_n_u8(bytes, 6), one_mask);
+            const uint16x8_t bits16 = vmovl_u8(bits);
+            const uint16x8_t weighted = vmulq_u16(bits16, weight);
+            const uint32x4_t sum32 = vpaddlq_u16(weighted);
+            const uint64x2_t sum64 = vpaddlq_u32(sum32);
+            const uint16_t mask = static_cast<uint16_t>(
+                vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1)
+            );
+            top_bit |= (static_cast<uint64_t>(mask) << (i / 8));
+        }
+        std::memcpy(o_compact, &top_bit, sizeof(uint64_t));
 
         o_compact += 8;
         o_raw += 64;
